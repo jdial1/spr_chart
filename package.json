@@ -1,0 +1,10 @@
+{
+  "name": "spr-chart",
+  "private": true,
+  "scripts": {
+    "dev": "serve -l 4477"
+  },
+  "devDependencies": {
+    "serve": "^14.2.4"
+  }
+}

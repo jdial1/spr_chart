@@ -84,6 +84,20 @@ body {
     margin: 4px 0 0;
 }
 
+.source-link {
+    color: var(--ant-primary-hover);
+    text-decoration: none;
+}
+
+.source-link:hover {
+    color: var(--ant-primary);
+    text-decoration: underline;
+}
+
+#stat-updated {
+    color: var(--ant-text-primary);
+}
+
 .header-stats {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -144,6 +158,36 @@ body {
     width: 100%;
     overflow: hidden;
     touch-action: pan-y pinch-zoom;
+    position: relative;
+}
+
+.chart-tooltip {
+    position: absolute;
+    z-index: 2;
+    max-width: min(240px, 70%);
+    padding: 8px 10px;
+    border: 1px solid var(--ant-border-color);
+    border-radius: 6px;
+    background: rgba(20, 20, 20, 0.94);
+    color: var(--ant-text-primary);
+    font-size: 0.75rem;
+    line-height: 1.35;
+    white-space: pre-line;
+    pointer-events: none;
+    box-shadow: var(--shadow-base);
+    transform: translate(12px, 12px);
+}
+
+.chart-tooltip[hidden] {
+    display: none;
+}
+
+.chart-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 14;
+    pointer-events: stroke;
+    cursor: help;
 }
 
 .chart-viewport svg {
@@ -247,6 +291,7 @@ svg {
     stroke-dasharray: 6 4;
     stroke-linecap: round;
     opacity: 0.85;
+    pointer-events: none;
 }
 
 .floor-region {
@@ -258,6 +303,23 @@ svg {
     stroke-width: 1;
     stroke-dasharray: 4 4;
     opacity: 0.7;
+    pointer-events: none;
+}
+
+.degradation-line {
+    stroke: var(--ant-warning);
+    stroke-width: 1;
+    stroke-dasharray: 6 4;
+    opacity: 0.65;
+    pointer-events: none;
+}
+
+.capacity-line {
+    stroke: var(--ant-success);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
+    opacity: 0.7;
+    pointer-events: none;
 }
 
 .drawdown-band-bg {
@@ -335,7 +397,9 @@ svg {
     }
 
     .app-meta {
-        display: none;
+        font-size: 0.68rem;
+        margin-top: 2px;
+        line-height: 1.35;
     }
 
     .label-long {

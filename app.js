@@ -1,13 +1,20 @@
-const TECHNICAL_FLOOR = 220000;
+const TECHNICAL_FLOOR = 243000;
 const FULL_CAPACITY = 714000;
+const DRAWDOWN_DEGRADATION_ONSET = 300000;
 const FLOOR_CHART_PADDING = 0.05;
 const EIA_API_KEY = '35d2c04d0a266f0cc2ca8ce655d4ee45';
-const EIA_API_URL = `https://api.eia.gov/v2/seriesid/PET.WCSSTUS1.W?api_key=${EIA_API_KEY}`;
+const EIA_SERIES_ID = 'PET.WCSSTUS1.W';
+const EIA_SOURCE_URL = 'https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?n=PET&s=WCSSTUS1&f=W';
+const EIA_API_URL = `https://api.eia.gov/v2/seriesid/${EIA_SERIES_ID}?api_key=${EIA_API_KEY}`;
 const MAX_CHART_EXTENSION_DAYS = 150;
 const CHART_PROJECTION_PADDING_DAYS = 30;
 const MAX_X_LABELS = 6;
 const MS_PER_DAY = 86400000;
+const MS_PER_WEEK = MS_PER_DAY * 7;
+const MAX_LEVEL_PROJECTION_WEEKS = 104;
 const CHART_START = new Date('2026-03-01T00:00:00');
+const REFILL_SPAN = FULL_CAPACITY - TECHNICAL_FLOOR;
+const DRAWDOWN_SPAN = DRAWDOWN_DEGRADATION_ONSET - TECHNICAL_FLOOR;
 
 const DRAWDOWN_BAND_RATIO = 0.26;
 const DRAWDOWN_BAND_GAP = 8;
@@ -27,7 +34,7 @@ const PROJECTION_METHODS = [
     { id: 'avgWeekly', label: '8W Avg Delta', color: '#52c41a', type: 'avgDelta', weeks: 8 },
     { id: 'annual', label: '12M Regression', color: '#eb2f96', type: 'regression', weeks: null },
     { id: 'quadratic', label: 'Quadratic Trend', color: '#ff4d4f', type: 'quadratic', weeks: 12 },
-    { id: 'decay', label: 'Hydraulic Capacity Decay', color: '#597ef7', type: 'decay', weeks: 8 },
+    { id: 'levelRate', label: 'Level-Dependent Rate', color: '#597ef7', type: 'levelRate' },
     { id: 'weighted26', label: '26W Weighted Regression', color: '#f759ab', type: 'weightedRegression', weeks: 26, alpha: 0.2 }
 ];
 
@@ -81,6 +88,7 @@ function applyChartData(parsedRecords) {
     document.getElementById('stat-fill-pct').textContent = `${fillPct}% of 714M capacity`;
 
     document.getElementById('stat-current').textContent = formatVolume(latestRecord.value);
+    updateSourceMeta(latestRecord.date);
     updateHeaderStats(projections, chartData);
     chartState.chartData = chartData;
     chartState.projections = projections;
@@ -125,6 +133,22 @@ function formatVolume(value) {
 
 function formatDate(date) {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function toISODate(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function updateSourceMeta(latestDate) {
+    const sourceLink = document.getElementById('source-link');
+    const updatedEl = document.getElementById('stat-updated');
+
+    sourceLink.href = EIA_SOURCE_URL;
+    updatedEl.dateTime = toISODate(latestDate);
+    updatedEl.textContent = formatDate(latestDate);
 }
 
 function regressionSlope(points) {
@@ -275,36 +299,113 @@ function weightedRegressionSlope(points, alpha = 0.2) {
     return (weightSum * sumXY - sumX * sumY) / denominator;
 }
 
-function calculateDecayProjection(points, weeks) {
+function calculateLevelRateProjection(points, drawdownModel, refillModel, regime) {
     const latest = points[points.length - 1];
-    const historicalSlope = endpointSlope(points, weeks);
-    const empty = { declining: false, daysUntilFloor: null, floorHitDate: null, simulatedPath: null, slopePerMs: historicalSlope || 0 };
+    const empty = {
+        declining: false,
+        rising: false,
+        daysUntilFloor: null,
+        floorHitDate: null,
+        daysUntilCapacity: null,
+        capacityHitDate: null,
+        simulatedPath: null,
+        slopePerMs: 0,
+        regime
+    };
 
-    if (historicalSlope === null || historicalSlope >= 0) return empty;
+    const direction = regime === 'drawdown' ? 'drawdown' : regime === 'refill' ? 'refill' : null;
+    if (!direction) return empty;
 
-    const dailyVelocity = historicalSlope * MS_PER_DAY;
-    let projectedDays = 0;
+    const model = direction === 'drawdown' ? drawdownModel : refillModel;
+    if (!model) return empty;
+
+    if (direction === 'drawdown' && latest.value <= TECHNICAL_FLOOR) {
+        return {
+            ...empty,
+            atOrBelowFloor: true,
+            declining: true,
+            daysUntilFloor: 0,
+            floorHitDate: latest.date,
+            slopePerMs: weeklyLevelRate(latest.value, model, direction) / MS_PER_WEEK
+        };
+    }
+
+    if (direction === 'refill' && latest.value >= FULL_CAPACITY) {
+        return {
+            ...empty,
+            atOrAboveCapacity: true,
+            rising: true,
+            daysUntilCapacity: 0,
+            capacityHitDate: latest.date,
+            slopePerMs: weeklyLevelRate(latest.value, model, direction) / MS_PER_WEEK
+        };
+    }
+
+    const initialRate = weeklyLevelRate(latest.value, model, direction);
+    if (initialRate === 0 || (direction === 'drawdown' && initialRate >= 0) || (direction === 'refill' && initialRate <= 0)) {
+        return { ...empty, slopePerMs: initialRate / MS_PER_WEEK };
+    }
+
+    let weeks = 0;
     let simulatedValue = latest.value;
     const simulatedPath = [{ date: new Date(latest.date), value: simulatedValue }];
 
-    while (simulatedValue > TECHNICAL_FLOOR && projectedDays < 365) {
-        projectedDays++;
-        const remainingBuffer = (simulatedValue - TECHNICAL_FLOOR) / (FULL_CAPACITY - TECHNICAL_FLOOR);
-        simulatedValue += dailyVelocity * Math.max(0.2, remainingBuffer);
+    while (weeks < MAX_LEVEL_PROJECTION_WEEKS) {
+        const rate = weeklyLevelRate(simulatedValue, model, direction);
+        if (Math.abs(rate) < 1e-6) break;
+
+        weeks++;
+        simulatedValue += rate;
+
+        if (direction === 'drawdown') {
+            simulatedValue = Math.max(TECHNICAL_FLOOR, simulatedValue);
+        } else {
+            simulatedValue = Math.min(FULL_CAPACITY, simulatedValue);
+        }
+
         simulatedPath.push({
-            date: new Date(latest.date.getTime() + projectedDays * MS_PER_DAY),
+            date: new Date(latest.date.getTime() + weeks * MS_PER_WEEK),
             value: simulatedValue
         });
+
+        if (direction === 'drawdown' ? simulatedValue <= TECHNICAL_FLOOR : simulatedValue >= FULL_CAPACITY) {
+            break;
+        }
     }
 
-    if (simulatedValue > TECHNICAL_FLOOR) return empty;
+    const reached = direction === 'drawdown'
+        ? simulatedValue <= TECHNICAL_FLOOR
+        : simulatedValue >= FULL_CAPACITY;
+
+    if (!reached) {
+        return {
+            ...empty,
+            simulatedPath,
+            slopePerMs: initialRate / MS_PER_WEEK
+        };
+    }
+
+    const hitDate = new Date(latest.date.getTime() + weeks * MS_PER_WEEK);
+    const daysUntil = weeks * 7;
+
+    if (direction === 'drawdown') {
+        return {
+            ...empty,
+            declining: true,
+            daysUntilFloor: daysUntil,
+            floorHitDate: hitDate,
+            simulatedPath,
+            slopePerMs: initialRate / MS_PER_WEEK
+        };
+    }
 
     return {
-        declining: true,
-        daysUntilFloor: projectedDays,
-        floorHitDate: new Date(latest.date.getTime() + projectedDays * MS_PER_DAY),
+        ...empty,
+        rising: true,
+        daysUntilCapacity: daysUntil,
+        capacityHitDate: hitDate,
         simulatedPath,
-        slopePerMs: historicalSlope
+        slopePerMs: initialRate / MS_PER_WEEK
     };
 }
 
@@ -320,27 +421,37 @@ function resolveSlope(method, dataPoints) {
     return null;
 }
 
-function buildProjection(method, dataPoints) {
+function buildProjection(method, dataPoints, context) {
     const latest = dataPoints[dataPoints.length - 1];
+    const { regime, drawdownModel, refillModel } = context;
     const base = {
         ...method,
         declining: false,
+        rising: false,
         atOrBelowFloor: false,
+        atOrAboveCapacity: false,
         slopePerMs: 0,
         daysUntilFloor: null,
         floorHitDate: null,
+        daysUntilCapacity: null,
+        capacityHitDate: null,
         curveType: null,
         quadraticCoeffs: null,
-        simulatedPath: null
+        simulatedPath: null,
+        regime
     };
 
-    if (latest.value <= TECHNICAL_FLOOR) {
-        return { ...base, atOrBelowFloor: true, daysUntilFloor: 0, floorHitDate: latest.date };
+    if (method.type === 'levelRate') {
+        const levelRate = calculateLevelRateProjection(dataPoints, drawdownModel, refillModel, regime);
+        return { ...base, ...levelRate, curveType: 'levelRate' };
     }
 
-    if (method.type === 'decay') {
-        const decay = calculateDecayProjection(dataPoints, method.weeks);
-        return { ...base, ...decay, curveType: 'decay' };
+    if (latest.value <= TECHNICAL_FLOOR) {
+        return { ...base, atOrBelowFloor: true, declining: true, daysUntilFloor: 0, floorHitDate: latest.date };
+    }
+
+    if (latest.value >= FULL_CAPACITY) {
+        return { ...base, atOrAboveCapacity: true, rising: true, daysUntilCapacity: 0, capacityHitDate: latest.date };
     }
 
     if (method.type === 'quadratic') {
@@ -351,22 +462,45 @@ function buildProjection(method, dataPoints) {
         const slopePerMs = quadraticSlopePerMs(coeffs, latest.date);
         const quadraticBase = { ...base, slopePerMs, quadraticCoeffs: coeffs, curveType: 'quadratic' };
 
-        if (slopePerMs >= 0) return quadraticBase;
+        if (slopePerMs < 0) {
+            const daysUntilFloor = findQuadraticFloorDays(coeffs, latest);
+            if (daysUntilFloor === null) return quadraticBase;
 
-        const daysUntilFloor = findQuadraticFloorDays(coeffs, latest);
-        if (daysUntilFloor === null) return quadraticBase;
+            return {
+                ...quadraticBase,
+                declining: true,
+                daysUntilFloor: Math.ceil(daysUntilFloor),
+                floorHitDate: new Date(latest.date.getTime() + daysUntilFloor * MS_PER_DAY)
+            };
+        }
 
-        return {
-            ...quadraticBase,
-            declining: true,
-            daysUntilFloor: Math.ceil(daysUntilFloor),
-            floorHitDate: new Date(latest.date.getTime() + daysUntilFloor * MS_PER_DAY)
-        };
+        if (slopePerMs > 0) {
+            const msUntilCapacity = (FULL_CAPACITY - latest.value) / slopePerMs;
+            return {
+                ...quadraticBase,
+                rising: true,
+                daysUntilCapacity: Math.ceil(msUntilCapacity / MS_PER_DAY),
+                capacityHitDate: new Date(latest.date.getTime() + msUntilCapacity)
+            };
+        }
+
+        return quadraticBase;
     }
 
     const slopePerMs = resolveSlope(method, dataPoints);
-    if (slopePerMs === null || slopePerMs >= 0) {
+    if (slopePerMs === null || slopePerMs === 0) {
         return { ...base, slopePerMs: slopePerMs || 0 };
+    }
+
+    if (slopePerMs > 0) {
+        const msUntilCapacity = (FULL_CAPACITY - latest.value) / slopePerMs;
+        return {
+            ...base,
+            rising: true,
+            slopePerMs,
+            daysUntilCapacity: Math.ceil(msUntilCapacity / MS_PER_DAY),
+            capacityHitDate: new Date(latest.date.getTime() + msUntilCapacity)
+        };
     }
 
     const msUntilFloor = (TECHNICAL_FLOOR - latest.value) / slopePerMs;
@@ -381,13 +515,41 @@ function buildProjection(method, dataPoints) {
 }
 
 function computeProjections(dataPoints) {
-    return PROJECTION_METHODS.map(method => buildProjection(method, dataPoints));
+    const regime = detectRegime(dataPoints);
+    const changes = computeWeeklyChanges(dataPoints);
+    const drawdownModel = fitLevelRateModel(changes, 'drawdown');
+    const refillModel = fitLevelRateModel(changes, 'refill');
+    const context = { regime, drawdownModel, refillModel };
+
+    return PROJECTION_METHODS.map(method => buildProjection(method, dataPoints, context));
 }
 
-function getSoonestProjections(projections) {
-    return projections
-        .filter(projection => projection.declining && projection.floorHitDate)
-        .sort((a, b) => a.daysUntilFloor - b.daysUntilFloor);
+function getDisplayedProjections(projections, regime) {
+    if (regime === 'drawdown') {
+        return projections
+            .filter(projection => projection.declining && projection.floorHitDate)
+            .sort((a, b) => a.daysUntilFloor - b.daysUntilFloor);
+    }
+
+    if (regime === 'refill') {
+        return projections
+            .filter(projection => projection.rising && projection.capacityHitDate)
+            .sort((a, b) => a.daysUntilCapacity - b.daysUntilCapacity);
+    }
+
+    return [];
+}
+
+function projectionHitDate(projection) {
+    return projection.declining ? projection.floorHitDate : projection.capacityHitDate;
+}
+
+function projectionHitDays(projection) {
+    return projection.declining ? projection.daysUntilFloor : projection.daysUntilCapacity;
+}
+
+function projectionHitValue(projection) {
+    return projection.declining ? TECHNICAL_FLOOR : FULL_CAPACITY;
 }
 
 function projectedValue(latest, slopePerMs, date) {
@@ -396,45 +558,49 @@ function projectedValue(latest, slopePerMs, date) {
 
 function buildProjectionPath(projection, latestPoint, chartMaxTime, getX, getY) {
     if (projection.curveType === 'quadratic' && projection.quadraticCoeffs) {
-        const endTime = projection.declining && projection.floorHitDate
-            ? Math.min(projection.floorHitDate.getTime(), chartMaxTime)
+        const hitDate = projectionHitDate(projection);
+        const hitValue = projectionHitValue(projection);
+        const endTime = hitDate
+            ? Math.min(hitDate.getTime(), chartMaxTime)
             : chartMaxTime;
         const stepMs = MS_PER_DAY * 2;
         let path = `M ${getX(latestPoint.date)} ${getY(latestPoint.value)}`;
 
         for (let t = latestPoint.date.getTime() + stepMs; t <= endTime; t += stepMs) {
             const date = new Date(t);
-            const value = Math.max(TECHNICAL_FLOOR, quadraticValueAt(projection.quadraticCoeffs, date));
+            const value = Math.min(FULL_CAPACITY, Math.max(TECHNICAL_FLOOR, quadraticValueAt(projection.quadraticCoeffs, date)));
             path += ` L ${getX(date)} ${getY(value)}`;
         }
 
-        if (projection.declining && projection.floorHitDate.getTime() <= chartMaxTime) {
-            path += ` L ${getX(projection.floorHitDate)} ${getY(TECHNICAL_FLOOR)}`;
+        if (hitDate && hitDate.getTime() <= chartMaxTime) {
+            path += ` L ${getX(hitDate)} ${getY(hitValue)}`;
         }
 
         return path;
     }
 
-    if (projection.curveType === 'decay' && projection.simulatedPath?.length > 1) {
+    if ((projection.curveType === 'levelRate' || projection.curveType === 'decay') && projection.simulatedPath?.length > 1) {
         const points = projection.simulatedPath.filter(point => point.date.getTime() <= chartMaxTime);
         let path = `M ${getX(points[0].date)} ${getY(points[0].value)}`;
 
         for (let i = 1; i < points.length; i++) {
-            const value = Math.max(TECHNICAL_FLOOR, points[i].value);
+            const value = Math.min(FULL_CAPACITY, Math.max(TECHNICAL_FLOOR, points[i].value));
             path += ` L ${getX(points[i].date)} ${getY(value)}`;
         }
 
         return path;
     }
 
-    const endDate = projection.declining && projection.floorHitDate
-        ? new Date(Math.min(projection.floorHitDate.getTime(), chartMaxTime))
+    const hitDate = projectionHitDate(projection);
+    const hitValue = projectionHitValue(projection);
+    const endDate = hitDate
+        ? new Date(Math.min(hitDate.getTime(), chartMaxTime))
         : new Date(chartMaxTime);
-    const endValue = projection.declining && projection.floorHitDate && projection.floorHitDate.getTime() <= chartMaxTime
-        ? TECHNICAL_FLOOR
+    const endValue = hitDate && hitDate.getTime() <= chartMaxTime
+        ? hitValue
         : projectedValue(latestPoint, projection.slopePerMs, endDate);
 
-    return `M ${getX(latestPoint.date)} ${getY(latestPoint.value)} L ${getX(endDate)} ${getY(Math.max(TECHNICAL_FLOOR, endValue))}`;
+    return `M ${getX(latestPoint.date)} ${getY(latestPoint.value)} L ${getX(endDate)} ${getY(Math.min(FULL_CAPACITY, Math.max(TECHNICAL_FLOOR, endValue)))}`;
 }
 
 function computeWeeklyChanges(dataPoints) {
@@ -443,11 +609,83 @@ function computeWeeklyChanges(dataPoints) {
     for (let i = 1; i < dataPoints.length; i++) {
         changes.push({
             date: dataPoints[i].date,
-            delta: dataPoints[i].value - dataPoints[i - 1].value
+            delta: dataPoints[i].value - dataPoints[i - 1].value,
+            level: dataPoints[i - 1].value
         });
     }
 
     return changes;
+}
+
+function detectRegime(dataPoints) {
+    const changes = computeWeeklyChanges(dataPoints);
+    if (changes.length === 0) return 'stable';
+
+    const delta = changes[changes.length - 1].delta;
+    if (delta < 0) return 'drawdown';
+    if (delta > 0) return 'refill';
+    return 'stable';
+}
+
+function inventoryBuffer(level, direction) {
+    if (direction === 'drawdown') {
+        if (level >= DRAWDOWN_DEGRADATION_ONSET) return 1;
+        return Math.max(0, (level - TECHNICAL_FLOOR) / DRAWDOWN_SPAN);
+    }
+    return Math.max(0, (FULL_CAPACITY - level) / REFILL_SPAN);
+}
+
+function fitLevelRateModel(changes, direction) {
+    const samples = changes
+        .filter(change => direction === 'drawdown' ? change.delta < 0 : change.delta > 0)
+        .map(change => ({
+            buffer: inventoryBuffer(change.level, direction),
+            magnitude: Math.abs(change.delta)
+        }))
+        .filter(sample => sample.buffer > 1e-6 && sample.magnitude > 0);
+
+    if (samples.length === 0) return null;
+
+    if (samples.length >= 3) {
+        let sumX = 0;
+        let sumY = 0;
+        let sumXY = 0;
+        let sumXX = 0;
+        const n = samples.length;
+
+        for (const sample of samples) {
+            const x = Math.log(sample.buffer);
+            const y = Math.log(sample.magnitude);
+            sumX += x;
+            sumY += y;
+            sumXY += x * y;
+            sumXX += x * x;
+        }
+
+        const denominator = n * sumXX - sumX * sumX;
+        if (denominator !== 0) {
+            const alpha = (n * sumXY - sumX * sumY) / denominator;
+            const logK = (sumY - alpha * sumX) / n;
+            const k = Math.exp(logK);
+            if (Number.isFinite(k) && k > 0 && Number.isFinite(alpha) && alpha >= 0) {
+                return { k, alpha };
+            }
+        }
+    }
+
+    let ratioSum = 0;
+    for (const sample of samples) {
+        ratioSum += sample.magnitude / sample.buffer;
+    }
+
+    return { k: ratioSum / samples.length, alpha: 1 };
+}
+
+function weeklyLevelRate(value, model, direction) {
+    if (!model) return 0;
+    const buffer = Math.max(0.15, inventoryBuffer(value, direction));
+    const magnitude = model.k * Math.pow(buffer, model.alpha);
+    return direction === 'drawdown' ? -magnitude : magnitude;
 }
 
 function drawdownBarFill(delta, prevDelta) {
@@ -485,14 +723,97 @@ function formatWeeklyRate(slopePerMs) {
 }
 
 function formatProjectionTarget(projection) {
-    if (projection.atOrBelowFloor) return 'Already at floor';
-    if (projection.declining) return `Floor on ${formatDate(projection.floorHitDate)}`;
-    return 'Stable or accumulating';
+    if (projection.atOrBelowFloor) return 'Already at certified floor';
+    if (projection.atOrAboveCapacity) return 'Already at capacity';
+    if (projection.declining) return `Certified floor on ${formatDate(projection.floorHitDate)}`;
+    if (projection.rising) return `Capacity on ${formatDate(projection.capacityHitDate)}`;
+    return 'Stable';
 }
 
-function updateVelocityStats(chartData) {
+function formatLevelRateLabel(projection) {
+    if (projection.type !== 'levelRate') return projection.label;
+    if (projection.regime === 'refill') return 'Level-Dependent Refill';
+    if (projection.regime === 'drawdown') return 'Level-Dependent Drawdown';
+    return projection.label;
+}
+
+function projectionTooltip(projection) {
+    return `${formatLevelRateLabel(projection)}\n${formatWeeklyRate(projection.slopePerMs)}\n${formatProjectionTarget(projection)}`;
+}
+
+function escapeAttr(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function dashedHitLine(className, x1, y1, x2, y2, tooltip) {
+    return `
+        <line class="${className}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" />
+        <line class="chart-hit" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" data-tooltip="${escapeAttr(tooltip)}" />
+    `;
+}
+
+function dashedHitPath(className, stroke, pathD, tooltip) {
+    return `
+        <path class="${className}" stroke="${stroke}" d="${pathD}" />
+        <path class="chart-hit" d="${pathD}" data-tooltip="${escapeAttr(tooltip)}" />
+    `;
+}
+
+function bindChartTooltips(svg) {
+    const tip = document.getElementById('chart-tooltip');
+    const viewport = svg.closest('.chart-viewport');
+    if (!tip || !viewport) return;
+
+    tip.hidden = true;
+
+    for (const hit of svg.querySelectorAll('[data-tooltip]')) {
+        hit.addEventListener('pointerenter', event => {
+            tip.textContent = hit.dataset.tooltip;
+            tip.hidden = false;
+            positionChartTooltip(tip, viewport, event);
+        });
+        hit.addEventListener('pointermove', event => {
+            positionChartTooltip(tip, viewport, event);
+        });
+        hit.addEventListener('pointerleave', () => {
+            tip.hidden = true;
+        });
+    }
+}
+
+function positionChartTooltip(tip, viewport, event) {
+    const bounds = viewport.getBoundingClientRect();
+    let left = event.clientX - bounds.left + 12;
+    let top = event.clientY - bounds.top + 12;
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+    tip.style.transform = 'none';
+
+    const tipBounds = tip.getBoundingClientRect();
+    if (tipBounds.right > bounds.right - 8) {
+        left = event.clientX - bounds.left - tipBounds.width - 12;
+    }
+    if (tipBounds.bottom > bounds.bottom - 8) {
+        top = event.clientY - bounds.top - tipBounds.height - 12;
+    }
+    tip.style.left = `${Math.max(8, left)}px`;
+    tip.style.top = `${Math.max(8, top)}px`;
+}
+
+function updateVelocityStats(chartData, regime) {
     const velocityEl = document.getElementById('stat-velocity');
+    const velocityLabelLong = document.getElementById('stat-velocity-label-long');
+    const velocityLabelShort = document.getElementById('stat-velocity-label-short');
     const changes = computeWeeklyChanges(chartData);
+
+    if (velocityLabelLong && velocityLabelShort) {
+        velocityLabelLong.textContent = regime === 'refill' ? 'Refill Velocity' : 'Drawdown Velocity';
+        velocityLabelShort.textContent = 'Velocity';
+    }
 
     if (changes.length < 2) {
         velocityEl.textContent = '—';
@@ -502,6 +823,20 @@ function updateVelocityStats(chartData) {
 
     const latest = changes[changes.length - 1].delta;
     const prior = changes[changes.length - 2].delta;
+
+    if (regime === 'refill') {
+        if (latest > prior) {
+            velocityEl.textContent = 'ACCELERATING';
+            velocityEl.style.color = 'var(--ant-success)';
+        } else if (latest < prior) {
+            velocityEl.textContent = 'DECELERATING';
+            velocityEl.style.color = 'var(--ant-warning)';
+        } else {
+            velocityEl.textContent = 'STEADY';
+            velocityEl.style.color = '';
+        }
+        return;
+    }
 
     if (latest < prior) {
         velocityEl.textContent = 'ACCELERATING';
@@ -519,22 +854,50 @@ function updateHeaderStats(projections, chartData) {
     const daysEl = document.getElementById('stat-days-range');
     const dateEl = document.getElementById('stat-date-range');
     const legendContainer = document.getElementById('projection-legend');
+    const legendTitle = document.getElementById('legend-title');
+    const targetLabelLong = document.getElementById('stat-target-label-long');
+    const targetLabelShort = document.getElementById('stat-target-label-short');
+    const regime = projections[0]?.regime || detectRegime(chartData);
+    const displayed = getDisplayedProjections(projections, regime);
     const atFloor = projections.find(projection => projection.atOrBelowFloor);
-    const declining = getSoonestProjections(projections);
+    const atCapacity = projections.find(projection => projection.atOrAboveCapacity);
 
-    updateVelocityStats(chartData);
+    updateVelocityStats(chartData, regime);
 
-    if (atFloor) {
+    if (targetLabelLong && targetLabelShort) {
+        if (regime === 'refill') {
+            targetLabelLong.textContent = 'Days to Capacity (Range)';
+            targetLabelShort.textContent = 'Capacity';
+        } else {
+            targetLabelLong.textContent = 'Days to Certified Floor (Range)';
+            targetLabelShort.textContent = 'Floor';
+        }
+    }
+
+    if (legendTitle) {
+        if (regime === 'refill') legendTitle.textContent = 'Refill Model Projections';
+        else if (regime === 'drawdown') legendTitle.textContent = 'Drawdown Model Projections';
+        else legendTitle.textContent = 'Model Projection Rates';
+    }
+
+    if (regime === 'drawdown' && atFloor) {
         daysEl.textContent = 'At floor';
         dateEl.textContent = formatDate(atFloor.floorHitDate);
-    } else if (declining.length === 0) {
+    } else if (regime === 'refill' && atCapacity) {
+        daysEl.textContent = 'At capacity';
+        dateEl.textContent = formatDate(atCapacity.capacityHitDate);
+    } else if (displayed.length === 0) {
         daysEl.textContent = 'Stable';
-        dateEl.textContent = 'No floor breach projected';
+        dateEl.textContent = regime === 'refill'
+            ? 'No capacity fill projected'
+            : 'No certified floor breach projected';
     } else {
-        const minDays = Math.min(...declining.map(projection => projection.daysUntilFloor));
-        const maxDays = Math.max(...declining.map(projection => projection.daysUntilFloor));
-        const minDateMs = Math.min(...declining.map(projection => projection.floorHitDate.getTime()));
-        const maxDateMs = Math.max(...declining.map(projection => projection.floorHitDate.getTime()));
+        const days = displayed.map(projectionHitDays);
+        const dates = displayed.map(projection => projectionHitDate(projection).getTime());
+        const minDays = Math.min(...days);
+        const maxDays = Math.max(...days);
+        const minDateMs = Math.min(...dates);
+        const maxDateMs = Math.max(...dates);
 
         daysEl.textContent = minDays === maxDays ? `${minDays}d` : `${minDays}d – ${maxDays}d`;
         dateEl.textContent = minDays === maxDays
@@ -542,11 +905,11 @@ function updateHeaderStats(projections, chartData) {
             : `${formatDate(new Date(minDateMs))} – ${formatDate(new Date(maxDateMs))}`;
     }
 
-    legendContainer.innerHTML = declining.map(projection => `
+    legendContainer.innerHTML = displayed.map(projection => `
         <div class="legend-item">
             <div class="legend-color-dot" style="background-color: ${projection.color}"></div>
             <div class="legend-info">
-                <div class="legend-name">${projection.label} (${formatWeeklyRate(projection.slopePerMs)})</div>
+                <div class="legend-name">${formatLevelRateLabel(projection)} (${formatWeeklyRate(projection.slopePerMs)})</div>
                 <div class="legend-meta">${formatProjectionTarget(projection)}</div>
             </div>
         </div>
@@ -564,20 +927,36 @@ function renderChart(dataPoints, projections) {
     const drawdownBandTop = paddingTop + inventoryHeight + DRAWDOWN_BAND_GAP;
     const drawdownZeroY = drawdownBandTop + 2;
 
+    const regime = projections[0]?.regime || detectRegime(dataPoints);
+    const displayedProjections = getDisplayedProjections(projections, regime);
     const values = dataPoints.map(d => d.value);
-    let maxVal = Math.ceil(Math.max(...values) / 50000) * 50000;
+    const latestValue = values[values.length - 1];
+    const pathPeak = displayedProjections.reduce((peak, projection) => {
+        if (projection.simulatedPath?.length) {
+            const visible = projection.simulatedPath.filter((_, index) => index * 7 <= MAX_CHART_EXTENSION_DAYS);
+            return Math.max(peak, ...visible.map(point => point.value));
+        }
+
+        const days = projectionHitDays(projection);
+        if (days !== null && days <= MAX_CHART_EXTENSION_DAYS) {
+            return Math.max(peak, projectionHitValue(projection));
+        }
+
+        return Math.max(peak, latestValue + projection.slopePerMs * MAX_CHART_EXTENSION_DAYS * MS_PER_DAY);
+    }, Math.max(...values));
+
+    let maxVal = Math.ceil(Math.max(...values, pathPeak) / 50000) * 50000;
     if (maxVal <= TECHNICAL_FLOOR) maxVal = TECHNICAL_FLOOR + 50000;
     const minVal = TECHNICAL_FLOOR - FLOOR_CHART_PADDING * (maxVal - TECHNICAL_FLOOR);
     const minTime = dataPoints[0].date.getTime();
     const maxTime = dataPoints[dataPoints.length - 1].date.getTime();
     const latestPoint = dataPoints[dataPoints.length - 1];
     const weeklyChanges = computeWeeklyChanges(dataPoints);
-    const displayedProjections = getSoonestProjections(projections);
 
     let chartMaxTime = maxTime;
     if (displayedProjections.length) {
-        const farthestFloorHit = Math.max(...displayedProjections.map(projection => projection.floorHitDate.getTime()));
-        const targetEnd = farthestFloorHit + CHART_PROJECTION_PADDING_DAYS * MS_PER_DAY;
+        const farthestHit = Math.max(...displayedProjections.map(projection => projectionHitDate(projection).getTime()));
+        const targetEnd = farthestHit + CHART_PROJECTION_PADDING_DAYS * MS_PER_DAY;
         const extensionMs = Math.min(targetEnd - maxTime, MAX_CHART_EXTENSION_DAYS * MS_PER_DAY);
         chartMaxTime = maxTime + Math.max(extensionMs, 14 * MS_PER_DAY);
     } else {
@@ -598,6 +977,7 @@ function renderChart(dataPoints, projections) {
 
     const axisStyle = `font-size:${axisFontSize}px`;
     const drawdownLabelStyle = `font-size:${Math.max(8, axisFontSize - 1)}px`;
+    const showCapacityLine = regime === 'refill' && FULL_CAPACITY <= maxVal;
 
     let elementsHTML = `
         <rect class="drawdown-band-bg" x="${paddingLeft}" y="${drawdownBandTop}" width="${plotWidth}" height="${drawdownBandHeight}" />
@@ -619,7 +999,8 @@ function renderChart(dataPoints, projections) {
         `;
     });
 
-    for (let v = TECHNICAL_FLOOR + 50000; v <= maxVal; v += 50000) {
+    for (let v = Math.ceil((TECHNICAL_FLOOR + 1) / 50000) * 50000; v <= maxVal; v += 50000) {
+        if (Math.abs(v - DRAWDOWN_DEGRADATION_ONSET) < 1000) continue;
         const yPos = getY(v);
         elementsHTML += `
             <line class="grid-line" x1="${paddingLeft}" y1="${yPos}" x2="${width - paddingRight}" y2="${yPos}" />
@@ -629,10 +1010,26 @@ function renderChart(dataPoints, projections) {
 
     const floorY = getY(TECHNICAL_FLOOR);
     elementsHTML += `
-        <line class="floor-line" x1="${paddingLeft}" y1="${floorY}" x2="${width - paddingRight}" y2="${floorY}" />
+        ${dashedHitLine('floor-line', paddingLeft, floorY, width - paddingRight, floorY, `SecDef certified floor\n${formatAxisValue(TECHNICAL_FLOOR)} bbl`)}
         <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${floorY + 4}" text-anchor="end" fill="#f5222d">${formatAxisValue(TECHNICAL_FLOOR)}</text>
         <line class="drawdown-band-divider" x1="${paddingLeft}" y1="${drawdownBandTop - 4}" x2="${width - paddingRight}" y2="${drawdownBandTop - 4}" />
     `;
+
+    if (DRAWDOWN_DEGRADATION_ONSET > minVal && DRAWDOWN_DEGRADATION_ONSET <= maxVal) {
+        const degradationY = getY(DRAWDOWN_DEGRADATION_ONSET);
+        elementsHTML += `
+            ${dashedHitLine('degradation-line', paddingLeft, degradationY, width - paddingRight, degradationY, `DOE drawdown degradation onset\n${formatAxisValue(DRAWDOWN_DEGRADATION_ONSET)} bbl`)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${degradationY + 4}" text-anchor="end" fill="#d48806">${formatAxisValue(DRAWDOWN_DEGRADATION_ONSET)}</text>
+        `;
+    }
+
+    if (showCapacityLine) {
+        const capacityY = getY(FULL_CAPACITY);
+        elementsHTML += `
+            ${dashedHitLine('capacity-line', paddingLeft, capacityY, width - paddingRight, capacityY, `Full SPR capacity\n${formatAxisValue(FULL_CAPACITY)} bbl`)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${capacityY + 4}" text-anchor="end" fill="#52c41a">${formatAxisValue(FULL_CAPACITY)}</text>
+        `;
+    }
 
     for (const tick of buildXAxisTicks(minTime, chartMaxTime, maxXLabels)) {
         const xPos = getX(tick);
@@ -651,11 +1048,13 @@ function renderChart(dataPoints, projections) {
     let projectionMarkup = '';
     for (const projection of displayedProjections) {
         const pathD = buildProjectionPath(projection, latestPoint, chartMaxTime, getX, getY);
-        const showFloorMarker = projection.floorHitDate.getTime() <= chartMaxTime;
+        const hitDate = projectionHitDate(projection);
+        const hitValue = projectionHitValue(projection);
+        const showHitMarker = hitDate.getTime() <= chartMaxTime && hitValue >= minVal && hitValue <= maxVal;
 
         projectionMarkup += `
-            <path class="projection-path" stroke="${projection.color}" d="${pathD}" />
-            ${showFloorMarker ? `<circle cx="${getX(projection.floorHitDate)}" cy="${getY(TECHNICAL_FLOOR)}" r="${floorDotRadius}" fill="${projection.color}" />` : ''}
+            ${dashedHitPath('projection-path', projection.color, pathD, projectionTooltip(projection))}
+            ${showHitMarker ? `<circle cx="${getX(hitDate)}" cy="${getY(hitValue)}" r="${floorDotRadius}" fill="${projection.color}" />` : ''}
         `;
     }
 
@@ -670,6 +1069,7 @@ function renderChart(dataPoints, projections) {
 
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    bindChartTooltips(svg);
 }
 
 function mobileBarCap(layout) {
