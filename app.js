@@ -1,6 +1,10 @@
-const TECHNICAL_FLOOR = 243000;
-const FULL_CAPACITY = 714000;
-const DRAWDOWN_DEGRADATION_ONSET = 300000;
+const TECHNICAL_FLOOR = 243000;               // 243.0M bbl - Certified operational hard floor
+const SECDEF_LIMIT = 250000;                  // 250.0M bbl - SecDef statutory defense limit
+const DRAWDOWN_DEGRADATION_ONSET = 300000;    // 300.0M bbl - DOE drawdown degradation / salt creep onset
+const PRE_CRISIS_BASELINE = 415440;           // 415.4M bbl - March 2026 pre-crisis baseline
+const STRUCTURAL_COLLAPSE_FLOOR = 150000;    // 150.0M bbl - RESPEC dilation failure boundary (FS <= 1.0)
+const FULL_CAPACITY = 714000;                // 714.0M bbl - Max authorized capacity
+
 const FLOOR_CHART_PADDING = 0.05;
 const EIA_API_KEY = '35d2c04d0a266f0cc2ca8ce655d4ee45';
 const EIA_SERIES_ID = 'PET.WCSSTUS1.W';
@@ -111,7 +115,7 @@ function getChartLayout() {
     const container = document.querySelector('.chart-viewport') || document.querySelector('.chart-panel');
     const containerWidth = container ? container.clientWidth : 800;
     const width = mobile ? Math.max(300, containerWidth) : 800;
-    const height = mobile ? Math.round(width * 0.78) : 450;
+    const height = mobile ? Math.round(width * 0.78) : 480;
 
     return {
         width,
@@ -745,13 +749,12 @@ function escapeAttr(value) {
     return String(value)
         .replace(/&/g, '&amp;')
         .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/</g, '&lt;');
 }
 
-function dashedHitLine(className, x1, y1, x2, y2, tooltip) {
+function dashedHitLine(className, x1, y1, x2, y2, tooltip, strokeColor = '#f5222d', dashArray = '4 4', strokeWidth = 1) {
     return `
-        <line class="${className}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" />
+        <line class="${className}" stroke="${strokeColor}" stroke-dasharray="${dashArray}" stroke-width="${strokeWidth}" opacity="0.85" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" />
         <line class="chart-hit" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" data-tooltip="${escapeAttr(tooltip)}" />
     `;
 }
@@ -945,9 +948,11 @@ function renderChart(dataPoints, projections) {
         return Math.max(peak, latestValue + projection.slopePerMs * MAX_CHART_EXTENSION_DAYS * MS_PER_DAY);
     }, Math.max(...values));
 
-    let maxVal = Math.ceil(Math.max(...values, pathPeak) / 50000) * 50000;
+    // Expand Y-axis boundaries so all 5 key lines (150M collapse up to 415.4M baseline) fit clearly
+    let maxVal = Math.ceil(Math.max(...values, pathPeak, PRE_CRISIS_BASELINE) / 50000) * 50000;
     if (maxVal <= TECHNICAL_FLOOR) maxVal = TECHNICAL_FLOOR + 50000;
-    const minVal = TECHNICAL_FLOOR - FLOOR_CHART_PADDING * (maxVal - TECHNICAL_FLOOR);
+    const minVal = STRUCTURAL_COLLAPSE_FLOOR - 10000; // 140,000 bbl scale minimum
+
     const minTime = dataPoints[0].date.getTime();
     const maxTime = dataPoints[dataPoints.length - 1].date.getTime();
     const latestPoint = dataPoints[dataPoints.length - 1];
@@ -999,8 +1004,14 @@ function renderChart(dataPoints, projections) {
         `;
     });
 
-    for (let v = Math.ceil((TECHNICAL_FLOOR + 1) / 50000) * 50000; v <= maxVal; v += 50000) {
+    // Background Grid Ticks (Skip values near key threshold lines)
+    for (let v = 150000; v <= maxVal; v += 50000) {
         if (Math.abs(v - DRAWDOWN_DEGRADATION_ONSET) < 1000) continue;
+        if (Math.abs(v - TECHNICAL_FLOOR) < 1000) continue;
+        if (Math.abs(v - SECDEF_LIMIT) < 1000) continue;
+        if (Math.abs(v - PRE_CRISIS_BASELINE) < 1000) continue;
+        if (Math.abs(v - STRUCTURAL_COLLAPSE_FLOOR) < 1000) continue;
+
         const yPos = getY(v);
         elementsHTML += `
             <line class="grid-line" x1="${paddingLeft}" y1="${yPos}" x2="${width - paddingRight}" y2="${yPos}" />
@@ -1008,25 +1019,59 @@ function renderChart(dataPoints, projections) {
         `;
     }
 
-    const floorY = getY(TECHNICAL_FLOOR);
-    elementsHTML += `
-        ${dashedHitLine('floor-line', paddingLeft, floorY, width - paddingRight, floorY, `SecDef certified floor\n${formatAxisValue(TECHNICAL_FLOOR)} bbl`)}
-        <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${floorY + 4}" text-anchor="end" fill="#f5222d">${formatAxisValue(TECHNICAL_FLOOR)}</text>
-        <line class="drawdown-band-divider" x1="${paddingLeft}" y1="${drawdownBandTop - 4}" x2="${width - paddingRight}" y2="${drawdownBandTop - 4}" />
-    `;
-
-    if (DRAWDOWN_DEGRADATION_ONSET > minVal && DRAWDOWN_DEGRADATION_ONSET <= maxVal) {
-        const degradationY = getY(DRAWDOWN_DEGRADATION_ONSET);
+    // Line 1: Pre-Crisis March 2026 Baseline (415.4M bbl)
+    if (PRE_CRISIS_BASELINE >= minVal && PRE_CRISIS_BASELINE <= maxVal) {
+        const baselineY = getY(PRE_CRISIS_BASELINE);
         elementsHTML += `
-            ${dashedHitLine('degradation-line', paddingLeft, degradationY, width - paddingRight, degradationY, `DOE drawdown degradation onset\n${formatAxisValue(DRAWDOWN_DEGRADATION_ONSET)} bbl`)}
-            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${degradationY + 4}" text-anchor="end" fill="#d48806">${formatAxisValue(DRAWDOWN_DEGRADATION_ONSET)}</text>
+            ${dashedHitLine('baseline-line', paddingLeft, baselineY, width - paddingRight, baselineY, `Pre-Crisis March 2026 Baseline\n${formatAxisValue(PRE_CRISIS_BASELINE)} bbl (415.44M bbl)`, '#1890ff', '6 4', 1.2)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${baselineY + 4}" text-anchor="end" fill="#1890ff">415.4M</text>
         `;
     }
+
+    // Line 2: DOE Drawdown Degradation Onset (300.0M bbl)
+    if (DRAWDOWN_DEGRADATION_ONSET >= minVal && DRAWDOWN_DEGRADATION_ONSET <= maxVal) {
+        const degradationY = getY(DRAWDOWN_DEGRADATION_ONSET);
+        elementsHTML += `
+            ${dashedHitLine('degradation-line', paddingLeft, degradationY, width - paddingRight, degradationY, `DOE drawdown degradation onset\nAccelerated salt creep & non-linear volume closure\n${formatAxisValue(DRAWDOWN_DEGRADATION_ONSET)} bbl`, '#d48806', '6 4', 1.2)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${degradationY + 4}" text-anchor="end" fill="#d48806">300M</text>
+        `;
+    }
+
+    // Line 3: SecDef Statutory Defense Buffer Limit (250.0M bbl)
+    if (SECDEF_LIMIT >= minVal && SECDEF_LIMIT <= maxVal) {
+        const secdefY = getY(SECDEF_LIMIT);
+        elementsHTML += `
+            ${dashedHitLine('secdef-line', paddingLeft, secdefY, width - paddingRight, secdefY, `SecDef statutory defense buffer limit\nMinimum military readiness floor\n${formatAxisValue(SECDEF_LIMIT)} bbl`, '#fa8c16', '4 4', 1.2)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${secdefY + 4}" text-anchor="end" fill="#fa8c16">250M</text>
+        `;
+    }
+
+    // Line 4: SecDef Certified Hard Operational Floor (243.0M bbl)
+    if (TECHNICAL_FLOOR >= minVal && TECHNICAL_FLOOR <= maxVal) {
+        const floorY = getY(TECHNICAL_FLOOR);
+        elementsHTML += `
+            ${dashedHitLine('floor-line', paddingLeft, floorY, width - paddingRight, floorY, `SecDef certified operational hard floor\n${formatAxisValue(TECHNICAL_FLOOR)} bbl`, '#f5222d', '4 4', 1.5)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${floorY + 4}" text-anchor="end" fill="#f5222d">243M</text>
+        `;
+    }
+
+    // Line 5: Theoretical Cavern Structural Collapse Boundary (150.0M bbl)
+    if (STRUCTURAL_COLLAPSE_FLOOR >= minVal && STRUCTURAL_COLLAPSE_FLOOR <= maxVal) {
+        const collapseY = getY(STRUCTURAL_COLLAPSE_FLOOR);
+        elementsHTML += `
+            ${dashedHitLine('collapse-line', paddingLeft, collapseY, width - paddingRight, collapseY, `Theoretical cavern collapse boundary\nRESPEC Dilation Failure Zone (FS <= 1.0)\nRoof fall & salt web failure risk\n${formatAxisValue(STRUCTURAL_COLLAPSE_FLOOR)} bbl`, '#a8071a', '2 2', 1.8)}
+            <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${collapseY + 4}" text-anchor="end" fill="#a8071a">150M</text>
+        `;
+    }
+
+    elementsHTML += `
+        <line class="drawdown-band-divider" x1="${paddingLeft}" y1="${drawdownBandTop - 4}" x2="${width - paddingRight}" y2="${drawdownBandTop - 4}" />
+    `;
 
     if (showCapacityLine) {
         const capacityY = getY(FULL_CAPACITY);
         elementsHTML += `
-            ${dashedHitLine('capacity-line', paddingLeft, capacityY, width - paddingRight, capacityY, `Full SPR capacity\n${formatAxisValue(FULL_CAPACITY)} bbl`)}
+            ${dashedHitLine('capacity-line', paddingLeft, capacityY, width - paddingRight, capacityY, `Full SPR capacity\n${formatAxisValue(FULL_CAPACITY)} bbl`, '#52c41a', '4 4', 1.2)}
             <text class="axis-text" style="${axisStyle}" x="${paddingLeft - 6}" y="${capacityY + 4}" text-anchor="end" fill="#52c41a">${formatAxisValue(FULL_CAPACITY)}</text>
         `;
     }
